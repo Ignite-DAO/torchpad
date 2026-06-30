@@ -30,6 +30,21 @@ interface IPlunderFactoryV2 {
     function getPair(address tokenA, address tokenB) external view returns (address pair);
 }
 
+interface IUniswapV3PoolMinimal {
+    function slot0()
+        external
+        view
+        returns (
+            uint160 sqrtPriceX96,
+            int24 tick,
+            uint16 observationIndex,
+            uint16 observationCardinality,
+            uint16 observationCardinalityNext,
+            uint8 feeProtocol,
+            bool unlocked
+        );
+}
+
 interface IWETH9 {
     function deposit() external payable;
     function withdraw(uint256 wad) external;

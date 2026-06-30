@@ -26,7 +26,7 @@ struct FairLaunchCreateParams {
     uint16 liquidityPercent; // 51-100 inclusive
     bool autoListing;
     FairLaunchRouterKind routerKind;
-    uint24 v3Fee; // e.g., 500, 3000, 10000. Ignored when routerKind == V2
+    uint24 v3Fee; // supported tiers: 100, 500, 2500, 10000. Ignored when routerKind == V2
     uint256 lockDuration; // seconds; type(uint256).max == indefinite
     bytes32 whitelistRoot;
     bool whitelistEnabled;

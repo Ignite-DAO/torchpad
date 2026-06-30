@@ -64,7 +64,7 @@ contract ForgeBondingCurveFactory is Ownable2Step, ReentrancyGuard {
         if (_routers.positionManager == address(0)) revert InvalidParam();
         if (_tradingFeePercent > 1000) revert InvalidParam(); // Max 10%
         if (_graduationFeePercent > 1000) revert InvalidParam(); // Max 10%
-        if (_defaultV3Fee == 0) revert InvalidParam();
+        if (!_isSupportedV3Fee(_defaultV3Fee)) revert InvalidParam();
         if (_graduationMarketCap < MIN_GRADUATION_MARKET_CAP) revert GraduationCapTooLow();
         if (_initialVirtualZilReserve == 0) revert InvalidParam();
 
@@ -163,9 +163,14 @@ contract ForgeBondingCurveFactory is Ownable2Step, ReentrancyGuard {
     }
 
     function setDefaultV3Fee(uint24 newFee) external onlyOwner {
-        if (newFee == 0) revert InvalidParam();
+        if (!_isSupportedV3Fee(newFee)) revert InvalidParam();
         emit DefaultV3FeeUpdated(defaultV3Fee, newFee);
         defaultV3Fee = newFee;
+    }
+
+    /// @dev Supported Plunder V3 fee tiers (must match ForgeBondingCurvePool tick spacing).
+    function _isSupportedV3Fee(uint24 fee) internal pure returns (bool) {
+        return fee == 100 || fee == 500 || fee == 2500 || fee == 10000;
     }
 
     function setRouterConfig(BondingCurveRouterConfig calldata config) external onlyOwner {

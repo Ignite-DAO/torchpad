@@ -10,6 +10,7 @@ import {ForgeBondingCurveToken} from "src/bondingcurve/ForgeBondingCurveToken.so
 import {
     BondingCurveCreateParams,
     BondingCurveRouterConfig,
+    BondingCurveInitParams,
     PoolState
 } from "src/bondingcurve/BondingCurveTypes.sol";
 import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
@@ -88,9 +89,9 @@ contract MockPositionManager {
         address,
         address,
         uint24,
-        uint160
-    ) external pure returns (address) {
-        return address(0);
+        uint160 sqrtPriceX96
+    ) external returns (address) {
+        return address(new MockV3Pool(sqrtPriceX96));
     }
 
     function mint(MintParams calldata params)
@@ -1527,6 +1528,116 @@ contract BondingCurveTest is Test {
             uint256 kAfterSell = pool.virtualTokenReserve() * pool.virtualZilReserve();
             assertApproxEqRel(kAfterSell, kBefore, 1e10, "k should remain constant after sell");
         }
+    }
+
+    // ------------------------------
+    // Security finding H-1: graduation front-run / pool price manipulation
+    // ------------------------------
+
+    // An attacker pre-initializes the Plunder V3 pool at a manipulated price before
+    // graduation. Because graduation minted liquidity with amount0Min/amount1Min == 0 and
+    // never checked the pool price, the raised liquidity could be added at the attacker's
+    // price and siphoned. The fix makes graduation revert when the pool price deviates from
+    // the curve's intended price.
+    function test_H1_Graduation_RevertsIfPoolPreInitializedAtManipulatedPrice() public {
+        MockWETH localWeth = new MockWETH();
+        MockV3Factory v3Factory = new MockV3Factory();
+        MockPositionManagerWithFactory pm = new MockPositionManagerWithFactory(address(v3Factory));
+
+        ForgeBondingCurvePool pool = _createLowCapPoolWithConfig(address(localWeth), address(pm));
+        IERC20 token = pool.token();
+
+        // Attacker front-runs graduation by initializing the V3 pool at an extreme price.
+        bool tokenIsToken0 = address(token) < address(localWeth);
+        address token0 = tokenIsToken0 ? address(token) : address(localWeth);
+        address token1 = tokenIsToken0 ? address(localWeth) : address(token);
+        pm.createAndInitializePoolIfNecessary(token0, token1, DEFAULT_V3_FEE, type(uint160).max);
+
+        // The buy that would trigger graduation must now revert instead of minting at the bad price.
+        vm.deal(alice, 10_000 ether);
+        vm.prank(alice);
+        vm.expectRevert(ForgeBondingCurvePool.UnexpectedPoolPrice.selector);
+        pool.buy{value: 100 ether}(0);
+    }
+
+    // Sanity: with no manipulation the same low-cap pool graduates normally (price check passes).
+    function test_H1_Graduation_SucceedsWhenPoolPriceIsHonest() public {
+        MockWETH localWeth = new MockWETH();
+        MockV3Factory v3Factory = new MockV3Factory();
+        MockPositionManagerWithFactory pm = new MockPositionManagerWithFactory(address(v3Factory));
+
+        ForgeBondingCurvePool pool = _createLowCapPoolWithConfig(address(localWeth), address(pm));
+
+        vm.deal(alice, 10_000 ether);
+        vm.prank(alice);
+        pool.buy{value: 100 ether}(0);
+
+        assertEq(uint8(pool.state()), uint8(PoolState.Graduated), "should graduate at honest price");
+    }
+
+    // ------------------------------
+    // Security finding M-1: V3 fee tier must be a supported tick-spacing tier
+    // ------------------------------
+
+    function test_M1_Factory_RejectsUnsupportedV3FeeTier_Setter() public {
+        // 3000 (0.3%) is a standard Uniswap tier but is NOT supported by _getTickSpacing.
+        vm.expectRevert(ForgeBondingCurveFactory.InvalidParam.selector);
+        factory.setDefaultV3Fee(3000);
+    }
+
+    function test_M1_Factory_RejectsUnsupportedV3FeeTier_Constructor() public {
+        BondingCurveRouterConfig memory config = BondingCurveRouterConfig({
+            wrappedNative: address(weth),
+            positionManager: address(positionManager)
+        });
+        vm.expectRevert(ForgeBondingCurveFactory.InvalidParam.selector);
+        new ForgeBondingCurveFactory(
+            treasury,
+            GRADUATION_MARKET_CAP,
+            INITIAL_VIRTUAL_ZIL_RESERVE,
+            TRADING_FEE_PERCENT,
+            GRADUATION_FEE_PERCENT,
+            uint24(3000),
+            config
+        );
+    }
+
+    function test_M1_Factory_AcceptsSupportedV3FeeTiers() public {
+        factory.setDefaultV3Fee(100);
+        assertEq(factory.defaultV3Fee(), 100);
+        factory.setDefaultV3Fee(500);
+        assertEq(factory.defaultV3Fee(), 500);
+        factory.setDefaultV3Fee(2500);
+        assertEq(factory.defaultV3Fee(), 2500);
+        factory.setDefaultV3Fee(10000);
+        assertEq(factory.defaultV3Fee(), 10000);
+    }
+
+    // Confirms the consequence the factory guard prevents: a pool carrying an unsupported
+    // fee tier can never graduate (the V3 tick-spacing lookup reverts).
+    function test_M1_Confirm_GraduationBricksWithUnsupportedFee() public {
+        BondingCurveInitParams memory params = BondingCurveInitParams({
+            creator: creator,
+            name: "Brick",
+            symbol: "BRK",
+            graduationMarketCap: 1 ether,
+            initialVirtualZilReserve: INITIAL_VIRTUAL_ZIL_RESERVE,
+            v3Fee: 3000, // unsupported tick spacing
+            treasury: treasury,
+            tradingFeePercent: TRADING_FEE_PERCENT,
+            graduationFeePercent: GRADUATION_FEE_PERCENT,
+            routers: BondingCurveRouterConfig({
+                wrappedNative: address(weth),
+                positionManager: address(positionManager)
+            })
+        });
+
+        ForgeBondingCurvePool pool = new ForgeBondingCurvePool(params);
+
+        vm.deal(alice, 10_000 ether);
+        vm.prank(alice);
+        vm.expectRevert(bytes("Invalid fee"));
+        pool.buy{value: 100 ether}(0);
     }
 
     // ------------------------------

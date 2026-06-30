@@ -7,7 +7,7 @@ import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import {Address} from "openzeppelin-contracts/contracts/utils/Address.sol";
 
 import {PoolState, BondingCurveInitParams} from "./BondingCurveTypes.sol";
-import {IWETH9, INonfungiblePositionManager} from "../fairlaunch/PlunderInterfaces.sol";
+import {IWETH9, INonfungiblePositionManager, IUniswapV3PoolMinimal} from "../fairlaunch/PlunderInterfaces.sol";
 import {ForgeBondingCurveToken} from "./ForgeBondingCurveToken.sol";
 
 contract ForgeBondingCurvePool is ReentrancyGuard {
@@ -19,6 +19,11 @@ contract ForgeBondingCurvePool is ReentrancyGuard {
     uint256 public constant MIN_BUY_AMOUNT = 0.001 ether;
     uint256 public constant MIN_SELL_TOKENS = 1e15;
     uint256 public constant MIN_GRADUATION_LIQUIDITY = 0.1 ether;
+    // Max deviation (in bps) allowed between the live V3 pool price and the curve's intended
+    // graduation price. Guards against a pool that was front-run/initialized at a bad price.
+    uint256 public constant GRADUATION_PRICE_TOLERANCE_BPS = 1000; // 10%
+    // Min-amount slippage (in bps) applied to graduation liquidity provision.
+    uint256 public constant GRADUATION_SLIPPAGE_BPS = 500; // 5%
     int24 private constant MAX_TICK = 887272;
     int24 private constant MIN_TICK = -887272;
 
@@ -33,6 +38,7 @@ contract ForgeBondingCurvePool is ReentrancyGuard {
     error TransferFailed();
     error LiquidityCreationFailed();
     error OnlyTreasury();
+    error UnexpectedPoolPrice();
 
     event Buy(
         address indexed buyer,
@@ -276,41 +282,73 @@ contract ForgeBondingCurvePool is ReentrancyGuard {
         returns (uint256 tokenId, uint256 usedToken, uint256 usedWeth)
     {
         bool tokenIsToken0 = address(token) < wrappedNative;
+        address token0 = tokenIsToken0 ? address(token) : wrappedNative;
+        address token1 = tokenIsToken0 ? wrappedNative : address(token);
+        uint256 amount0Desired = tokenIsToken0 ? liquidityTokens : liquidityZil;
+        uint256 amount1Desired = tokenIsToken0 ? liquidityZil : liquidityTokens;
 
-        INonfungiblePositionManager(positionManager).createAndInitializePoolIfNecessary(
-            tokenIsToken0 ? address(token) : wrappedNative,
-            tokenIsToken0 ? wrappedNative : address(token),
-            v3Fee,
-            _calculateSqrtPriceX96(
-                tokenIsToken0 ? liquidityTokens : liquidityZil,
-                tokenIsToken0 ? liquidityZil : liquidityTokens
-            )
-        );
+        _createAndValidateV3Pool(token0, token1, amount0Desired, amount1Desired);
 
-        (int24 tickLower, int24 tickUpper) = _getFullRangeTicks(v3Fee);
+        uint256 amount0;
+        uint256 amount1;
+        (tokenId, amount0, amount1) = _mintFullRange(token0, token1, amount0Desired, amount1Desired);
 
-        (uint256 mintedTokenId, uint128 liquidity, uint256 amount0, uint256 amount1) =
-            INonfungiblePositionManager(positionManager).mint(
-                INonfungiblePositionManager.MintParams({
-                    token0: tokenIsToken0 ? address(token) : wrappedNative,
-                    token1: tokenIsToken0 ? wrappedNative : address(token),
-                    fee: v3Fee,
-                    tickLower: tickLower,
-                    tickUpper: tickUpper,
-                    amount0Desired: tokenIsToken0 ? liquidityTokens : liquidityZil,
-                    amount1Desired: tokenIsToken0 ? liquidityZil : liquidityTokens,
-                    amount0Min: 0,
-                    amount1Min: 0,
-                    recipient: address(this),
-                    deadline: block.timestamp + 900
-                })
-            );
-
-        if (mintedTokenId == 0 || liquidity == 0) revert LiquidityCreationFailed();
-
-        tokenId = mintedTokenId;
         usedToken = tokenIsToken0 ? amount0 : amount1;
         usedWeth = tokenIsToken0 ? amount1 : amount0;
+    }
+
+    /// @dev Creates/initializes the V3 pool and reverts if its live price deviates from the
+    /// curve's intended graduation price (front-run / manipulated-price protection).
+    function _createAndValidateV3Pool(
+        address token0,
+        address token1,
+        uint256 amount0Desired,
+        uint256 amount1Desired
+    ) internal {
+        uint160 intendedSqrtPrice = _calculateSqrtPriceX96(amount0Desired, amount1Desired);
+
+        address v3Pool = INonfungiblePositionManager(positionManager).createAndInitializePoolIfNecessary(
+            token0, token1, v3Fee, intendedSqrtPrice
+        );
+
+        (uint160 actualSqrtPrice,,,,,,) = IUniswapV3PoolMinimal(v3Pool).slot0();
+        if (!_priceWithinTolerance(actualSqrtPrice, intendedSqrtPrice)) revert UnexpectedPoolPrice();
+    }
+
+    /// @dev Mints a full-range position with min-amount slippage protection.
+    function _mintFullRange(
+        address token0,
+        address token1,
+        uint256 amount0Desired,
+        uint256 amount1Desired
+    ) internal returns (uint256 tokenId, uint256 amount0, uint256 amount1) {
+        (int24 tickLower, int24 tickUpper) = _getFullRangeTicks(v3Fee);
+
+        uint128 liquidity;
+        (tokenId, liquidity, amount0, amount1) = INonfungiblePositionManager(positionManager).mint(
+            INonfungiblePositionManager.MintParams({
+                token0: token0,
+                token1: token1,
+                fee: v3Fee,
+                tickLower: tickLower,
+                tickUpper: tickUpper,
+                amount0Desired: amount0Desired,
+                amount1Desired: amount1Desired,
+                amount0Min: (amount0Desired * (FEE_DENOMINATOR - GRADUATION_SLIPPAGE_BPS)) / FEE_DENOMINATOR,
+                amount1Min: (amount1Desired * (FEE_DENOMINATOR - GRADUATION_SLIPPAGE_BPS)) / FEE_DENOMINATOR,
+                recipient: address(this),
+                deadline: block.timestamp + 900
+            })
+        );
+
+        if (tokenId == 0 || liquidity == 0) revert LiquidityCreationFailed();
+    }
+
+    function _priceWithinTolerance(uint160 actual, uint160 intended) internal pure returns (bool) {
+        if (intended == 0) return false;
+        uint256 lo = (uint256(intended) * (FEE_DENOMINATOR - GRADUATION_PRICE_TOLERANCE_BPS)) / FEE_DENOMINATOR;
+        uint256 hi = (uint256(intended) * (FEE_DENOMINATOR + GRADUATION_PRICE_TOLERANCE_BPS)) / FEE_DENOMINATOR;
+        return uint256(actual) >= lo && uint256(actual) <= hi;
     }
 
     function _sweepLeftovers(uint256 liquidityTokens, uint256 liquidityZil, uint256 usedToken, uint256 usedWeth)

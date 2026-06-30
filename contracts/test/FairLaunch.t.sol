@@ -185,6 +185,65 @@ contract FairLaunchTest is Test {
     }
 
     // ------------------------------
+    // Security finding M-1: V3 fee tier validation (fair launch)
+    // ------------------------------
+
+    function _v3RouterConfig() internal pure returns (FairLaunchRouterConfig memory) {
+        return FairLaunchRouterConfig({
+            routerV2: address(0xBEEF),
+            factoryV2: address(0xCAFE),
+            wrappedNative: address(0xF00D),
+            v3Factory: address(0),
+            v3PoolDeployer: address(0),
+            v3Migrator: address(0),
+            positionManager: address(0xABCD)
+        });
+    }
+
+    // A creator selecting V3 auto-listing with an unsupported fee tier (e.g. 3000) would
+    // deploy a sale whose finalize() can never succeed (the V3 tick-spacing lookup reverts).
+    // The fix rejects the unsupported tier up-front at creation.
+    function test_M1_FairLaunch_RejectsUnsupportedV3FeeTier() public {
+        ForgeFairLaunchFactory v3Factory = new ForgeFairLaunchFactory(treasury, address(usdc), _v3RouterConfig());
+
+        FairLaunchCreateParams memory params = _defaultParams(FairLaunchCurrency.ZIL);
+        params.routerKind = FairLaunchRouterKind.V3;
+        params.autoListing = true;
+        params.v3Fee = 3000; // unsupported tick spacing tier
+        params.lockDuration = 30 days;
+
+        uint256 required = _tokensRequired(params);
+        saleToken.transfer(creator, required);
+
+        vm.startPrank(creator);
+        saleToken.approve(address(v3Factory), required);
+        vm.expectRevert(ForgeFairLaunchFactory.InvalidParam.selector);
+        v3Factory.createLaunch(params);
+        vm.stopPrank();
+    }
+
+    function test_M1_FairLaunch_AcceptsSupportedV3FeeTier() public {
+        ForgeFairLaunchFactory v3Factory = new ForgeFairLaunchFactory(treasury, address(usdc), _v3RouterConfig());
+
+        FairLaunchCreateParams memory params = _defaultParams(FairLaunchCurrency.ZIL);
+        params.routerKind = FairLaunchRouterKind.V3;
+        params.autoListing = true;
+        params.v3Fee = 10000; // supported tier
+        params.lockDuration = 30 days;
+
+        uint256 required = _tokensRequired(params);
+        saleToken.transfer(creator, required);
+
+        vm.startPrank(creator);
+        saleToken.approve(address(v3Factory), required);
+        address pool = v3Factory.createLaunch(params);
+        vm.stopPrank();
+
+        assertEq(v3Factory.launchCount(), 1);
+        assertTrue(pool != address(0));
+    }
+
+    // ------------------------------
     // Helpers
     // ------------------------------
 

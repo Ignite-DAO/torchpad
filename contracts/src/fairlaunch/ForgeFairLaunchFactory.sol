@@ -121,7 +121,7 @@ contract ForgeFairLaunchFactory is Ownable2Step, ReentrancyGuard {
             endTime: params.endTime,
             autoListing: params.autoListing,
             routerKind: params.routerKind,
-            v3Fee: params.routerKind == FairLaunchRouterKind.V3 && params.v3Fee == 0 ? 3000 : params.v3Fee,
+            v3Fee: params.routerKind == FairLaunchRouterKind.V3 && params.v3Fee == 0 ? 10000 : params.v3Fee,
             lockDuration: params.lockDuration,
             whitelistRoot: params.whitelistRoot,
             whitelistEnabled: params.whitelistEnabled,
@@ -161,10 +161,15 @@ contract ForgeFairLaunchFactory is Ownable2Step, ReentrancyGuard {
         if (params.endTime <= params.startTime) revert InvalidParam();
         if (params.startTime < block.timestamp) revert InvalidParam();
         if (params.hardCap != 0 && params.hardCap < params.softCap) revert InvalidParam();
-        if (params.routerKind == FairLaunchRouterKind.V3 && params.v3Fee == 0 && params.autoListing) {
+        if (params.routerKind == FairLaunchRouterKind.V3 && params.autoListing && !_isSupportedV3Fee(params.v3Fee)) {
             revert InvalidParam();
         }
         if (!_isAllowedLockDuration(params.lockDuration)) revert InvalidParam();
+    }
+
+    /// @dev Supported Plunder V3 fee tiers (must match ForgeFairLaunchPool tick spacing).
+    function _isSupportedV3Fee(uint24 fee) internal pure returns (bool) {
+        return fee == 100 || fee == 500 || fee == 2500 || fee == 10000;
     }
 
     function _isAllowedLockDuration(uint256 duration) internal pure returns (bool) {
